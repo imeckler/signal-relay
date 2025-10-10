@@ -1,17 +1,21 @@
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::io::{self, Write};
 use std::net::IpAddr;
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::Result;
 use base64::engine::{general_purpose::STANDARD, Engine};
-use clap::Parser;
+use clap::{Id, Parser};
 use futures_util::future::BoxFuture;
+use futures_util::stream::Skip;
 use futures_util::FutureExt;
+use http::{header, HeaderMap, HeaderName, HeaderValue};
 use libsignal_core::curve::{KeyPair, PublicKey};
-use libsignal_net::chat::ws::ListenerEvent;
-use libsignal_net::chat::{ChatConnection, ChatHeaders, ConnectError, LanguageList};
+use libsignal_net::chat::server_requests::ServerEvent;
+use libsignal_net::chat::ws::{self, Chat, ListenerEvent, Responder};
+use libsignal_net::chat::{ChatConnection, ChatHeaders, ConnectError, LanguageList, Request};
 use libsignal_net::connect_state::{
     ConnectState, ConnectionResources, DefaultConnectorFactory, SUGGESTED_CONNECT_CONFIG,
     SUGGESTED_TLS_PRECONNECT_LIFETIME,
@@ -24,14 +28,18 @@ use libsignal_net::infra::route::{
 };
 use libsignal_net::infra::tcp_ssl::TcpSslConnector;
 use libsignal_net::infra::{EnableDomainFronting, EnforceMinimumTls};
+use libsignal_net::proto::chat_websocket::WebSocketRequestMessage;
 use libsignal_net_chat::api::ChallengeOption;
 use libsignal_net_chat::api::{registration::*, Unauth};
 use libsignal_net_chat::registration::{ConnectUnauthChat, RegistrationService};
-use libsignal_protocol::GenericSignedPreKey;
-use libsignal_protocol::KyberPreKeyRecord;
+use libsignal_net_grpc::proto::chat::account::ConfirmUsernameHashRequest;
+use libsignal_protocol::{kem, sealed_sender_encrypt, KyberPreKeyRecord};
+use libsignal_protocol::{GenericSignedPreKey, IdentityKeyPair, InMemSignalProtocolStore};
+use messaging::{decrypt_message, encrypt_message};
 use rand_core::{OsRng, TryRngCore};
-use serde::{Deserialize, Serialize};
+use serde::{ser, Deserialize, Serialize};
 use tokio::sync::oneshot;
+use zkgroup::profiles::ProfileKey;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -39,6 +47,40 @@ struct Args {
     /// Phone number to register (e.g., +1234567890)
     #[arg(short, long)]
     phone_number: String,
+}
+
+fn sample_password<R: rand_core::CryptoRng>(rng: &mut R, len: usize) -> Vec<u8> {
+    // Digits: 48-57
+    // Upper: 65-90
+    // Lower: 97-122
+    // Hyphen: 45
+    // Underscore: 95
+    //
+    // 0-9 => 48-57
+    // 10-35 => 65-90
+    // 36-61 => 97-122
+    // 62 => 45
+    // 63 => 95
+    fn encode(x: u8) -> u8 {
+        if x < 10 {
+            48 + x
+        } else if x < 36 {
+            (x - 10) + 65
+        } else if x < 62 {
+            (x - 36) + 97
+        } else if x == 62 {
+            45
+        } else if x == 63 {
+            95
+        } else {
+            panic!("Invalid byte")
+        }
+    }
+
+    let mut buf = vec![0u8; len];
+    rng.fill_bytes(&mut buf);
+    buf.iter_mut().for_each(|b| *b = encode(*b & 63));
+    buf
 }
 
 #[tokio::main]
@@ -57,7 +99,7 @@ async fn main() -> Result<()> {
     let mut rng = OsRng.unwrap_err();
 
     // Generate and serialize keys
-    let _keys = generate_keys(&mut rng);
+    let (sks, keys) = generate_keys(&mut rng);
     log::info!("Generated keys successfully");
 
     // TODO : Serialize keys!
@@ -119,9 +161,84 @@ async fn main() -> Result<()> {
         log::info!("Verification code submitted successfully");
     }
 
+    let password = sample_password(&mut rng, 40);
+    let recovery_password = sample_password(&mut rng, 40);
+
+    let profile_key = {
+        let mut randomness = [0u8; 32]; // RANDOMNESS_LEN = 32
+        rng.try_fill_bytes(&mut randomness).unwrap();
+        ProfileKey::generate(randomness)
+    };
+
+    use rand::Rng;
+    let registration_id = rng.random::<u16>() & 0x3FFF;
+    let pni_registration_id = rng.random::<u16>() & 0x3FFF;
+
+    registration_service.register_account(
+        NewMessageNotification::WillFetchMessages,
+        ProvidedAccountAttributes {
+            recovery_password: &recovery_password,
+            registration_id,
+            pni_registration_id,
+            // Device name. None for the primary device.
+            name: None,
+            registration_lock: None,
+            unidentified_access_key: &profile_key.derive_access_key(),
+            unrestricted_unidentified_access: false,
+            capabilities: HashSet::new(),
+            discoverable_by_phone_number: false,
+        },
+        Some(SkipDeviceTransfer),
+        ForServiceIds::generate(|k| keys.get(k).as_borrowed()),
+        &str::from_utf8(&password).unwrap(),
+    );
+
     // TODO: Would have to submit all the data to register the account. Make sure keys are
     // serialized before doing this!
     // registration_service.register_account(message_notification, account_attributes, device_transfer, keys, account_password)
+
+    let connector = ProductionChatConnector {
+        user_agent: UserAgent::with_libsignal_version("TODO"),
+        dns_resolver: DnsResolver::new(&network_change_event),
+        network_change_event,
+        connect_state: ConnectState::new_with_transport_connector(
+            SUGGESTED_CONNECT_CONFIG,
+            PreconnectingFactory::new(DefaultConnectorFactory, SUGGESTED_TLS_PRECONNECT_LIFETIME),
+        ),
+    };
+    // TODO:
+    // to send a message, we need to call the send function in libsignal_net::chat::ws,
+    // which is a method on the Chat type, so we need to get a "Chat", which wraps the connection
+    // to the server.
+    // TODO: figure out what to pass for on_disconnect
+    let chat = connector.connect_chat(on_disconnect).await?;
+    chat.send(
+        Request {
+            method: http::Method::POST,
+            path: "/v1/message",
+            headers: HeaderMap::from_iter([
+                (
+                    HeaderName::from("X-Signal-Key"),
+                    HeaderValue::from_str("false"),
+                ),
+                (
+                    HeaderName::from("X-Signal-Timestamp"),
+                    HeaderValue::from_str(Instant::now().duration_since(UNIX_EPOCH).as_millis()),
+                ),
+            ]),
+            body: sealed_sender_encrypt(
+                // TODO: figure out what these have to be
+                destination,
+                sender_cert,
+                ptext,
+                session_store,
+                identity_store,
+                now,
+                rng,
+            ),
+        },
+        timeout,
+    );
 
     return Ok(());
 }
@@ -182,18 +299,11 @@ impl ConnectUnauthChat for ProductionChatConnector {
         let route_provider = {
             let env = PROD;
 
-            let proxy_config: Option<ConnectionProxyConfig> =
-                (&*transport_connector.lock().expect("not poisoned"))
-                    .try_into()
-                    .map_err(|_| ConnectError::InvalidConnectionConfiguration)
-                    .unwrap();
-
             let chat_connect = &env.chat_domain_config.connect;
 
-            DirectOrProxyProvider::maybe_proxied(
+            DirectOrProxyProvider::direct(
                 chat_connect
                     .route_provider_with_options(enable_domain_fronting, EnforceMinimumTls::No),
-                proxy_config,
             )
         };
 
@@ -214,7 +324,9 @@ impl ConnectUnauthChat for ProductionChatConnector {
                 local_idle_timeout: Duration::from_secs(60),
                 remote_idle_timeout: Duration::from_secs(60),
                 initial_request_id: 0,
+                post_request_interface_check_timeout: Duration::from_secs(60),
             },
+            libsignal_net::chat::EnablePermessageDeflate::No,
             headers,
             "logging",
         );
@@ -225,6 +337,16 @@ impl ConnectUnauthChat for ProductionChatConnector {
                     let listener = move |event| match event {
                         ListenerEvent::Finished(_) => drop(on_disconnect.take()),
                         ListenerEvent::ReceivedAlerts(_) | ListenerEvent::ReceivedMessage(_, _) => {
+                            let event: Result<ServerEvent, _> = event.try_into().unwrap();
+                            let (addr, msg) = decrypt_message(
+                                ciphertext,
+                                trust_root,
+                                local_uuid,
+                                local_device_id,
+                                store,
+                                rng,
+                            );
+                            // TODO: do something with the encrypted message
                         }
                     };
                     // let listener: libsignal_net::chat::ws::EventListener = Box::new(|_event| {});
@@ -261,43 +383,58 @@ impl OwnedAccountKeys {
 }
 
 /// Generate random keypairs
-fn generate_keys<R: rand_core::CryptoRng>(csprng: &mut R) -> ForServiceIds<OwnedAccountKeys> {
-    let keys = ForServiceIds::generate(|_| {
-        let identity_key = KeyPair::generate(csprng).public_key;
-
-        let signed_pre_key = {
-            let key_pair = KeyPair::generate(csprng);
-            SignedPreKeyBody {
-                key_id: 1,
-                public_key: key_pair.public_key.serialize(),
-                signature: (*b"signature").into(),
-            }
-        };
-        let pq_last_resort_pre_key = {
-            let kem_keypair = libsignal_protocol::kem::KeyPair::generate(
+fn generate_keys<R: rand_core::CryptoRng>(
+    csprng: &mut R,
+) -> (
+    ForServiceIds<(IdentityKeyPair, libsignal_protocol::kem::KeyPair)>,
+    ForServiceIds<OwnedAccountKeys>,
+) {
+    let secret_keys = ForServiceIds::generate(|__| {
+        (
+            IdentityKeyPair::generate(csprng),
+            libsignal_protocol::kem::KeyPair::generate(
                 libsignal_protocol::kem::KeyType::Kyber1024,
                 csprng,
-            );
-            let record = KyberPreKeyRecord::new(
-                1.into(),
-                libsignal_protocol::Timestamp::from_epoch_millis(42),
-                &kem_keypair,
-                b"signature",
-            );
+            ),
+        )
+    });
+    let keys = ForServiceIds::generate(|kind| {
+        let (identity, kem_keypair) = secret_keys.get(kind);
+
+        let signed_pre_key = {
+            let pk = identity.public_key().serialize();
+            let id: u32 = csprng.next_u32();
             SignedPreKeyBody {
-                key_id: 1,
-                public_key: Box::from(record.get_storage().public_key.clone()),
-                signature: Box::from(record.get_storage().signature.clone()),
+                key_id: id,
+                signature: identity
+                    .private_key()
+                    .calculate_signature(&pk, csprng)
+                    .unwrap(),
+                public_key: pk,
+            }
+        };
+
+        let pq_last_resort_pre_key = {
+            let id: u32 = csprng.next_u32();
+
+            let public_key = kem_keypair.public_key.serialize();
+            SignedPreKeyBody {
+                key_id: id,
+                signature: identity
+                    .private_key()
+                    .calculate_signature(&public_key, csprng)
+                    .unwrap(),
+                public_key,
             }
         };
 
         OwnedAccountKeys {
-            identity_key,
+            identity_key: identity.public_key().clone(),
             signed_pre_key,
             pq_last_resort_pre_key,
         }
     });
-    keys
+    (secret_keys, keys)
 }
 
 // Create a struct that owns the byte data
