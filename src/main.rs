@@ -32,7 +32,7 @@ use libsignal_net::infra::{EnableDomainFronting, EnforceMinimumTls};
 use libsignal_net_chat::api::ChallengeOption;
 use libsignal_net_chat::api::{registration::*, Unauth};
 use libsignal_net_chat::registration::{ConnectUnauthChat, RegistrationService};
-use libsignal_protocol::{sealed_sender_decrypt, sealed_sender_encrypt, IdentityKeyStore, SenderCertificate, ServerCertificate, Timestamp};
+use libsignal_protocol::{sealed_sender_decrypt, sealed_sender_encrypt, IdentityKeyStore, PrivateKey, SenderCertificate, ServerCertificate, Timestamp};
 use libsignal_protocol::{IdentityKeyPair, InMemSignalProtocolStore};
 use rand_core::{OsRng, TryRngCore};
 use serde::{Deserialize, Serialize};
@@ -172,7 +172,7 @@ async fn main() -> Result<()> {
     let registration_id = rng.random::<u16>() & 0x3FFF;
     let pni_registration_id = rng.random::<u16>() & 0x3FFF;
 
-    let _ = registration_service.register_account(
+    let registed_account = registration_service.register_account(
         NewMessageNotification::WillFetchMessages,
         ProvidedAccountAttributes {
             recovery_password: &recovery_password,
@@ -189,11 +189,13 @@ async fn main() -> Result<()> {
         Some(SkipDeviceTransfer),
         ForServiceIds::generate(|k| keys.get(k).as_borrowed()),
         &str::from_utf8(&password).unwrap(),
-    ).await;
+    ).await?;
 
-    // TODO: Would have to submit all the data to register the account. Make sure keys are
-    // serialized before doing this!
-    // registration_service.register_account(message_notification, account_attributes, device_transfer, keys, account_password)
+    // Extract the aci directly
+    let user_aci = registed_account.aci;
+
+    // The aci is the uuid, we just need to make it a string
+    println!("Registration successful! UUID (ACI): {:?}", user_aci.service_id_string());
 
     let network_change_event = SENDER_THAT_NEVER_SENDS.subscribe();
 
@@ -206,11 +208,6 @@ async fn main() -> Result<()> {
             PreconnectingFactory::new(DefaultConnectorFactory, SUGGESTED_TLS_PRECONNECT_LIFETIME),
         ),
     };
-    // TODO:
-    // to send a message, we need to call the send function in libsignal_net::chat::ws,
-    // which is a method on the Chat type, so we need to get a "Chat", which wraps the connection
-    // to the server.
-    // TODO: figure out what to pass for on_disconnect
 
     let (tx, rx) = oneshot::channel();
     let chat = connector.connect_chat(tx).await?;
@@ -219,24 +216,35 @@ async fn main() -> Result<()> {
     let test_ptext = vec![1, 2, 3, 23, 99]; // TODO: get real text here
     let mut store = InMemSignalProtocolStore::new(IdentityKeyPair::generate(&mut rng), rng.random::<u32>())?;
 
-    let trust_root = KeyPair::generate(&mut rng);
-    let server_key = KeyPair::generate(&mut rng);
-    let server_cert = ServerCertificate::new(1, server_key.public_key, &trust_root.private_key, &mut rng)?;
+    // these are the results of:
+    // data_encoding_macro::base64!("BUkY0I+9+oPgDCn4+Ac6Iu813yvqkDr/ga8DzLxFxuk6")
+    // &const_str::hex!("0a250803122105bc9d1d290be964810dfa7e94856480a3f7060d004c9762c24c575a1522353a5a1240c11ec3c401eb0107ab38f8600e8720a63169e0e2eb8a3fae24f63099f85ea319c3c1c46d3454706ae2a679d1fee690a488adda98a2290b66c906bb60295ed781")
+    // which come from KNOWN_SERVER_CERTIFICATES in sealed_sender.rs
+    let trust_root: [u8; 33] = [5, 73, 24, 208, 143, 189, 250, 131, 224, 12, 41, 248, 248, 7, 58, 34, 239, 53, 223, 43, 234, 144, 58, 255, 129, 175, 3, 204, 188, 69, 198, 233, 58];
+    let cert: &[u8; 105] = &[10, 37, 8, 3, 18, 33, 5, 188, 157, 29, 41, 11, 233, 100, 129, 13, 250, 126, 148, 133, 100, 128, 163, 247, 6, 13, 0, 76, 151, 98, 194, 76, 87, 90, 21, 34, 53, 58, 90, 18, 64, 193, 30, 195, 196, 1, 235, 1, 7, 171, 56, 248, 96, 14, 135, 32, 166, 49, 105, 224, 226, 235, 138, 63, 174, 36, 246, 48, 153, 248, 94, 163, 25, 195, 193, 196, 109, 52, 84, 112, 106, 226, 166, 121, 209, 254, 230, 144, 164, 136, 173, 218, 152, 162, 41, 11, 102, 201, 6, 187, 96, 41, 94, 215, 129];
+
+    // Neither of these seem to work unfortunately
+    let server_cert = ServerCertificate::deserialize(cert).expect("valid");
+    // let server_cert = ServerCertificate::new(
+    //     3, 
+    //     PublicKey::deserialize(&trust_root).expect("valid"), 
+    //     &PrivateKey::deserialize(&trust_root).expect("valid"),
+    //     &mut rng
+    // );
 
     let sender_cert = SenderCertificate::new(
-        "9d0652a3-dcc3-4d11-975f-74d61598733f".to_string().clone(),
-        Some("+12345678901".to_owned().clone()),
+        user_aci.service_id_string(),
+        Some(registed_account.number),
         *store.get_identity_key_pair().await?.public_key(),
-        DeviceId::new(23).unwrap(),
+        DeviceId::new(1).unwrap(), // the first device registered is given device id 1
         Timestamp::from_epoch_millis(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64),
         server_cert,
-        &server_key.private_key,
+        &PrivateKey::deserialize(&trust_root).expect("valid"),
         &mut rng,
     )?;
 
     let body = sealed_sender_encrypt(
-        // TODO: figure out what these have to be
-        &ProtocolAddress::new("796abedb-ca4e-4f18-8803-1fde5b921f9f".to_string().clone(), DeviceId::new(42).unwrap()),
+        &ProtocolAddress::new("eric.7615".to_string().clone(), DeviceId::new(2).unwrap()),
         &sender_cert,
         &test_ptext,
         &mut store.session_store,
